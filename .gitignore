@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Models & heavy assets
+models/
+
+# Personal / private data — never commit
+references/
+cloned_voices.json
+cloned_voices.json.bak
+*.wav
+
+# Logs
+*.log
+
+# Backups & private notes
+_backup_pre_concurrency_fix/
+popcorn4_AGENTS.md
+
+# Secrets
+.env
+.env.*
+test_output.json

@@ -17,6 +17,8 @@ standard client works without knowing what is running underneath.
 ```
 server.py          — FastAPI app, routes, lifespan (entrypoint)
 model_manager.py   — VRAM-aware model registry (ModelManager singleton)
+admission.py       — capacity-based request gates (FIFO queue per backend)
+documentation.py   — serves these docs at /documentation (markdown or HTML)
 providers/
   tts.py           — Qwen3-TTS worker management + voice synthesis
   tts_worker.py    — TTS inference subprocess
@@ -37,15 +39,22 @@ providers/
 - **Serialised load/unload per model** — one `asyncio.Lock` per model name with the
   `loaded` check re-run inside the lock: concurrent load calls run the load exactly
   once and every caller receives the same handle.
+- **Capacity-based admission** — each backend admits exactly as many requests as it
+  can run (llama-server slots, one TTS/STT/SDXL job) and queues the rest FIFO. A
+  freed slot goes straight to the next waiter: no polling, and clients never have
+  to retry on a timer. Disconnected clients are dropped or aborted, and a full queue
+  answers 429 with a measured `Retry-After`.
 
 See [AGENTS.md](AGENTS.md) for the full engineering notes and [API.md](API.md) for
-endpoint documentation.
+endpoint documentation. All of it is also served by the running API at
+`/documentation` (markdown for clients, HTML for browsers), next to Swagger at `/docs`.
 
 ## Endpoints (OpenAI-compatible)
 
 `/v1/chat/completions` (+ `/cancel`) · `/v1/embeddings` · `/v1/images/generations` ·
 `/v1/audio/speech` · `/v1/audio/transcriptions` · `/models` (load/unload) ·
-`/health` (GPU telemetry) · voice-clone CRUD under `/audio/voices`
+`/health` (GPU telemetry + queues) · voice-clone CRUD under `/audio/voices` ·
+`/documentation` (these docs) · `/SKILL.md` (agent skill)
 
 ## Models
 

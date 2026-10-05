@@ -13,11 +13,16 @@ import asyncio
 import logging
 import numpy as np
 
+import admission
+
 logger = logging.getLogger("provider.stt")
 
 STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "large-v3-turbo")
 # ~3 GB VRAM for large-v3-turbo (turbo is smaller than original large-v3)
 STT_VRAM_GB = float(os.getenv("STT_VRAM_GB", "3"))
+# One transcription on the GPU at a time; concurrent ones only contend.
+STT_MAX_QUEUE = int(os.getenv("STT_MAX_QUEUE", "16"))
+gate = admission.gate("stt", 1, max_queue=STT_MAX_QUEUE, initial_service_s=3.0)
 
 _WHISPER_MODEL = None
 _FASTER_WHISPER_AVAILABLE = False
@@ -148,6 +153,8 @@ async def transcribe(
     audio_bytes: bytes,
     language: str | None = None,
     response_format: str = "json",
+    *,
+    request=None,
 ) -> dict:
     """Transcribe audio bytes and return OpenAI-compatible response."""
     if _WHISPER_MODEL is None:
@@ -155,7 +162,13 @@ async def transcribe(
 
     # Whisper inference is fully synchronous and takes seconds; running it
     # inline would block the event loop and stall every other request.
-    text, duration = await asyncio.to_thread(_transcribe_sync, audio_bytes, language)
+    # A thread can't be interrupted: a queued request whose client leaves is
+    # dropped, but one already transcribing holds the GPU until it is done.
+    text, duration = await gate.run(
+        lambda: asyncio.to_thread(_transcribe_sync, audio_bytes, language),
+        request=request,
+        interruptible=False,
+    )
 
     if response_format == "verbose_json":
         return {"text": text, "duration": duration, "language": language or "en"}

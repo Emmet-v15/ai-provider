@@ -19,6 +19,8 @@ import logging
 import httpx
 from fastapi import HTTPException
 
+import admission
+
 logger = logging.getLogger("provider.tts")
 
 # ── config ────────────────────────────────────────────────────────────
@@ -46,6 +48,12 @@ _proc: sp.Popen | None = None
 _worker_url: str | None = None
 _log_fh = None
 WORKER_START_TIMEOUT = 90  # single model load
+
+# The worker's handlers run inference inline on its event loop, so it does
+# one job at a time no matter how many are sent; queue here instead, where a
+# waiter whose client has gone can be dropped.
+TTS_MAX_QUEUE = int(os.getenv("TTS_MAX_QUEUE", "16"))
+gate = admission.gate("tts", 1, max_queue=TTS_MAX_QUEUE, initial_service_s=4.0)
 
 # Serialises worker start/stop.  Without it two overlapping loads each pick
 # their own free port and spawn a worker; the second overwrites the _proc /
@@ -105,15 +113,23 @@ def _find_free_port() -> int:
 
 
 async def _wait_for_worker(url: str, timeout: int = WORKER_START_TIMEOUT) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    interval = 0.25
     async with httpx.AsyncClient() as client:
-        for _ in range(timeout):
+        while loop.time() < deadline:
+            # A worker that crashed on import will never answer; don't sit
+            # out the full timeout waiting for it.
+            if _proc is not None and _proc.poll() is not None:
+                return False
             try:
                 r = await client.get(f"{url}/health", timeout=3)
                 if r.status_code == 200:
                     return True
             except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
                 pass
-            await asyncio.sleep(1)
+            await asyncio.sleep(interval)
+            interval = min(interval * 1.5, 1.0)
     return False
 
 
@@ -162,6 +178,7 @@ async def _start_worker_locked() -> str:
 
 async def stop_worker():
     """Kill the worker subprocess, releasing all VRAM."""
+    gate.cancel_all()
     async with _worker_lock:
         await _stop_worker_locked()
 
@@ -205,10 +222,17 @@ def is_running() -> bool:
 
 
 # ── synthesis proxy ───────────────────────────────────────────────────
-async def _proxy_synthesize(payload: dict) -> tuple[bytes, str, float, str]:
-    url = f"{get_worker_url()}/synthesize"
-    async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post(url, json=payload)
+async def _proxy_synthesize(payload: dict, request=None) -> tuple[bytes, str, float, str]:
+    async def _call() -> httpx.Response:
+        # Resolved inside the slot: the worker may have been restarted
+        # while this request was queued.
+        url = f"{get_worker_url()}/synthesize"
+        async with httpx.AsyncClient(timeout=300) as client:
+            return await client.post(url, json=payload)
+
+    # The worker computes to the end even if this connection closes, so the
+    # slot stays held until it answers.
+    r = await gate.run(_call, request=request, interruptible=False)
     if r.status_code != 200:
         try:
             detail = r.json().get("detail", str(r.content[:300]))
@@ -228,6 +252,7 @@ async def synthesize_audio(
     speaker: str,
     *,
     fmt: str = "opus",
+    request=None,
 ) -> tuple[bytes, str, float, str]:
     tag = speaker.strip().lower()
 
@@ -240,7 +265,7 @@ async def synthesize_audio(
             "language": language,
             "clone_prompt_path": cv.get("prompt_path", ""),
             "fmt": fmt,
-        })
+        }, request)
 
     raise HTTPException(400, f"Unknown voice '{speaker}'. Available: {', '.join(get_all_voices())}")
 
@@ -253,6 +278,7 @@ async def synthesize_clone(
     *,
     prompt_path: str | None = None,
     fmt: str = "opus",
+    request=None,
 ) -> tuple[bytes, str, float, str]:
     if prompt_path:
         return await _proxy_synthesize({
@@ -260,7 +286,7 @@ async def synthesize_clone(
             "language": language,
             "clone_prompt_path": prompt_path,
             "fmt": fmt,
-        })
+        }, request)
     if ref_audio:
         return await _proxy_synthesize({
             "text": text,
@@ -268,7 +294,7 @@ async def synthesize_clone(
             "clone_ref_audio_b64": ref_audio,
             "clone_ref_text": ref_text,
             "fmt": fmt,
-        })
+        }, request)
     raise HTTPException(400, "One of prompt_path or ref_audio is required for clone synthesis")
 
 
@@ -278,12 +304,17 @@ async def precompute_clone(tag: str, ref_text: str = "") -> dict:
     The caller MUST have already saved ``{REFS_DIR}/{tag}.wav``.
     Returns ``{"prompt_path": str, "mode": str}``.
     """
-    url = f"{get_worker_url()}/clone-precompute"
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(url, json={
-            "tag": tag,
-            "ref_text": ref_text,
-        })
+    async def _call() -> httpx.Response:
+        url = f"{get_worker_url()}/clone-precompute"
+        async with httpx.AsyncClient(timeout=120) as client:
+            return await client.post(url, json={
+                "tag": tag,
+                "ref_text": ref_text,
+            })
+
+    # Same worker, same one-at-a-time constraint as synthesis.  No client
+    # tie-in: the wav is already on disk, so finish the prompt regardless.
+    r = await gate.run(_call, interruptible=False)
     if r.status_code != 200:
         try:
             detail = r.json().get("detail", str(r.content[:300]))

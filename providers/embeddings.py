@@ -14,6 +14,9 @@ import time
 import logging
 import httpx
 
+import admission
+from providers.llm import fetch_total_slots, wait_ready
+
 logger = logging.getLogger("provider.embeddings")
 
 # ── config ────────────────────────────────────────────────────────────
@@ -32,6 +35,7 @@ LLAMA_SERVER_EXE = os.getenv("LLAMA_SERVER_EXE") or next(
 )
 
 EMBED_VRAM_GB = float(os.getenv("EMBED_VRAM_GB", "0.5"))
+EMBED_MAX_QUEUE = int(os.getenv("EMBED_MAX_QUEUE", "64"))
 
 
 class EmbeddingsProvider:
@@ -44,6 +48,10 @@ class EmbeddingsProvider:
         # Serialises start/stop so two overlapping loads cannot both spawn a
         # llama-server on the same port.
         self._lock = asyncio.Lock()
+        # Sized from /props once the server is up.
+        self.gate = admission.gate(
+            "llm-embed", 4, max_queue=EMBED_MAX_QUEUE, initial_service_s=0.2,
+        )
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -97,24 +105,18 @@ class EmbeddingsProvider:
             self._proc = proc
 
             t0 = time.time()
-            while time.time() - t0 < 120:
-                if proc.poll() is not None:
-                    self._proc = None
-                    raise RuntimeError(
-                        f"Embeddings server exited during startup (code {proc.returncode}) — "
-                        f"port {self._port} may already be in use"
-                    )
-                try:
-                    r = await self.client.get(
-                        f"{self.base_url}/v1/models",
-                        timeout=5.0,
-                    )
-                    if r.status_code == 200:
-                        logger.info("Embeddings server ready on port %d (%.1fs)", self._port, time.time() - t0)
-                        return
-                except Exception:
-                    pass
-                await _sleep(3)
+            if await wait_ready(proc, self.client, self.base_url, deadline_s=120):
+                logger.info("Embeddings server ready on port %d (%.1fs)", self._port, time.time() - t0)
+                slots = await fetch_total_slots(self.client, self.base_url)
+                if slots:
+                    self.gate.resize(slots)
+                return
+            if proc.poll() is not None:
+                self._proc = None
+                raise RuntimeError(
+                    f"Embeddings server exited during startup (code {proc.returncode}) — "
+                    f"port {self._port} may already be in use"
+                )
 
             # Don't leave an orphan holding VRAM behind on timeout.
             await self._kill_proc()
@@ -132,20 +134,25 @@ class EmbeddingsProvider:
 
     async def stop(self) -> None:
         async with self._lock:
+            self.gate.cancel_all()
             await self._kill_proc()
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
 
-    async def embeddings(self, body: dict) -> dict:
+    async def embeddings(self, body: dict, *, request=None) -> dict:
         if not self.is_running:
             raise RuntimeError("Embeddings server not running")
-        r = await self.client.post(
-            f"{self.base_url}/v1/embeddings",
-            json=body,
-        )
-        r.raise_for_status()
-        return r.json()
+
+        async def _call() -> dict:
+            r = await self.client.post(
+                f"{self.base_url}/v1/embeddings",
+                json=body,
+            )
+            r.raise_for_status()
+            return r.json()
+
+        return await self.gate.run(_call, request=request)
 
 
 _provider: EmbeddingsProvider | None = None
@@ -175,7 +182,3 @@ async def load_models():
 
 async def unload_models():
     await get_provider().stop()
-
-
-async def _sleep(secs: float):
-    await __import__("asyncio").sleep(secs)

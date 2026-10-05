@@ -25,6 +25,7 @@ import torch
 from diffusers import StableDiffusionXLPipeline
 from huggingface_hub import hf_hub_download
 
+import admission
 
 logger = logging.getLogger("provider.image")
 
@@ -33,6 +34,12 @@ MODEL_REPO = "John6666/ramthrusts-nsfw-pink-alchemy-mix-169-sdxl"
 MODEL_FILE = "RAMTHRUST_S-NSFW-PINK-ALCHEMY-MIX.safetensors"
 DTYPE = torch.bfloat16
 VRAM_GB = 12.0  # peak ~12 GB during inference (9 GB idle + ~3 GB compute buffers)
+IMAGE_MAX_QUEUE = int(os.getenv("IMAGE_MAX_QUEUE", "8"))
+
+# One pipeline, one generation at a time.  Two concurrent to_thread() calls
+# into the same StableDiffusionXLPipeline share its scheduler state and
+# corrupt each other, besides each needing their own ~3 GB of activations.
+gate = admission.gate("sdxl", 1, max_queue=IMAGE_MAX_QUEUE, initial_service_s=30.0)
 
 
 # ── state ─────────────────────────────────────────────────────────────
@@ -171,15 +178,21 @@ async def generate_txt2img(
     num_inference_steps: int = 25,
     guidance_scale: float = 7.0,
     seed: int | None = None,
+    *,
+    request=None,
 ) -> bytes:
-    """Async wrapper around _generate_sync."""
-    return await asyncio.to_thread(
-        _generate_sync,
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        width=width,
-        height=height,
-        num_inference_steps=num_inference_steps,
-        guidance_scale=guidance_scale,
-        seed=seed,
+    """Async wrapper around _generate_sync, one generation at a time."""
+    return await gate.run(
+        lambda: asyncio.to_thread(
+            _generate_sync,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+        ),
+        request=request,
+        interruptible=False,
     )

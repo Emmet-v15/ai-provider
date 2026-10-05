@@ -14,7 +14,8 @@ import time
 import logging
 import httpx
 from dataclasses import dataclass
-from urllib.parse import urljoin
+
+import admission
 
 logger = logging.getLogger("provider.llm")
 
@@ -27,6 +28,12 @@ CHAT_EXTRA = os.getenv(
     "LLM_CHAT_EXTRA",
     "-fa on --cache-type-k q8_0 --cache-type-v q8_0",
 )
+# How many requests may wait for a chat slot before new ones are refused
+# with 429.  Requests wait in *our* FIFO (see admission.py), not inside
+# llama-server, so a waiter whose client hangs up costs nothing.
+CHAT_MAX_QUEUE = int(os.getenv("CHAT_MAX_QUEUE", "32"))
+# llama-server's own default; replaced by the real figure from /props on start.
+_DEFAULT_SLOTS = 4
 LLAMA_SERVER_EXE = os.getenv("LLAMA_SERVER_EXE") or next(
     (p for p in [
         r"C:\llama-cpp\llama-server.exe",
@@ -125,10 +132,14 @@ class LLMProvider:
         self._port = CHAT_PORT
         self._variant: ChatVariant = CHAT_VARIANTS[DEFAULT_VARIANT]
         self._client: httpx.AsyncClient | None = None
-        # Persistent bounded pool for chat completions — a per-request client
-        # leaks server-side sockets when requests are aborted/cancelled.
+        # Persistent pool for chat completions — a per-request client leaks
+        # server-side sockets when requests are aborted/cancelled.
         self._chat_client: httpx.AsyncClient | None = None
-        self._inflight_client: httpx.AsyncClient | None = None
+        # One request per llama-server slot; the rest queue here.
+        self.gate = admission.gate(
+            MODEL_NAME, _DEFAULT_SLOTS,
+            max_queue=CHAT_MAX_QUEUE, initial_service_s=8.0,
+        )
         # Serialises start/stop so two overlapping loads cannot both spawn a
         # llama-server on the same port.
         self._lock = asyncio.Lock()
@@ -236,30 +247,34 @@ class LLMProvider:
             )
             self._proc = proc
 
-            # Wait for the server to be ready
+            # 5 min ceiling covers a first-run HF download plus load.
             t0 = time.time()
-            while time.time() - t0 < 300:  # 5 min timeout for model download+load
-                if proc.poll() is not None:
-                    self._proc = None
-                    raise RuntimeError(
-                        f"LLM server exited during startup (code {proc.returncode}) — "
-                        f"port {self._port} may already be in use"
-                    )
-                try:
-                    r = await self.client.get(
-                        f"{self.base_url}/v1/models",
-                        timeout=5.0,
-                    )
-                    if r.status_code == 200:
-                        logger.info("LLM server ready on port %d (%.1fs)", self._port, time.time() - t0)
-                        return
-                except Exception:
-                    pass
-                await _sleep(5)
+            if await wait_ready(proc, self.client, self.base_url, deadline_s=300):
+                logger.info("LLM server ready on port %d (%.1fs)", self._port, time.time() - t0)
+                await self._size_gate()
+                return
+            if proc.poll() is not None:
+                self._proc = None
+                raise RuntimeError(
+                    f"LLM server exited during startup (code {proc.returncode}) — "
+                    f"port {self._port} may already be in use"
+                )
 
             # Don't leave an orphan holding VRAM behind on timeout.
             await self._kill_proc()
             raise RuntimeError("LLM server failed to start within 300s")
+
+    async def _size_gate(self) -> None:
+        """Match the gate to the slot count llama-server actually started with.
+
+        ``-np``/``--parallel`` can come from ``LLM_CHAT_EXTRA`` or from
+        llama-server's own default, so ask rather than assume.
+        """
+        slots = await fetch_total_slots(self.client, self.base_url)
+        if slots:
+            if slots != self.gate.capacity:
+                logger.info("chat gate: %d -> %d slots", self.gate.capacity, slots)
+            self.gate.resize(slots)
 
     async def _kill_proc(self) -> None:
         if self._proc:
@@ -273,7 +288,7 @@ class LLMProvider:
 
     async def stop(self) -> None:
         async with self._lock:
-            self.cancel_current()
+            self.gate.cancel_all()
             await self._kill_proc()
             if self._client is not None:
                 await self._client.aclose()
@@ -282,36 +297,49 @@ class LLMProvider:
                 await self._chat_client.aclose()
                 self._chat_client = None
 
-    def cancel_current(self) -> bool:
-        """Cancel the in-flight chat completion request, if any."""
-        client = self._inflight_client
-        if client is not None:
-            self._inflight_client = None
-            import asyncio
-            asyncio.ensure_future(client.aclose())
-            return True
-        return False
+    def cancel_current(self) -> int:
+        """Cancel every chat completion running or queued; returns how many.
 
-    async def chat_completions(self, body: dict) -> dict:
-        if not self.is_running:
-            raise RuntimeError("LLM server not running")
+        Cancelling a running request closes its upstream connection, which
+        makes llama-server abort that slot's generation.  The old version
+        closed the *shared* client instead — which also killed every other
+        request on it, and was a no-op whenever a different request had
+        finished last and cleared the single ``_inflight_client`` reference.
+        """
+        return self.gate.cancel_all()
+
+    @property
+    def chat_client(self) -> httpx.AsyncClient:
         if self._chat_client is None or self._chat_client.is_closed:
             self._chat_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(300.0),
-                limits=httpx.Limits(max_connections=8),
+                # The gate admits only as many requests as there are slots,
+                # so this read timeout bounds a generation, not time spent
+                # queued behind other ones.  No pool limit: the gate is the
+                # limit, and a second, hidden queue in the pool would bring
+                # back exactly the waiting-on-a-timeout this replaces.
+                timeout=httpx.Timeout(300.0, connect=10.0, pool=None),
+                limits=httpx.Limits(max_connections=None, max_keepalive_connections=16),
             )
-        # Shared so cancel_current() can abort the in-flight request
-        client = self._chat_client
-        self._inflight_client = client
-        try:
-            r = await client.post(
+        return self._chat_client
+
+    async def chat_completions(self, body: dict, *, request=None) -> dict:
+        """Proxy one completion, waiting in the gate for a free slot.
+
+        Raises one of ``admission.ADMISSION_ERRORS`` when the request is
+        refused, abandoned by its client, or cancelled.
+        """
+        if not self.is_running:
+            raise RuntimeError("LLM server not running")
+
+        async def _call() -> dict:
+            r = await self.chat_client.post(
                 f"{self.base_url}/v1/chat/completions",
                 json=body,
             )
             r.raise_for_status()
             return r.json()
-        finally:
-            self._inflight_client = None
+
+        return await self.gate.run(_call, request=request)
 
     async def models(self) -> dict:
         if not self.is_running:
@@ -395,5 +423,43 @@ async def unload_models():
     await get_provider().stop()
 
 
-async def _sleep(secs: float):
-    await __import__("asyncio").sleep(secs)
+async def wait_ready(
+    proc: sp.Popen,
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    deadline_s: float,
+) -> bool:
+    """Wait until a llama-server answers ``/health`` with 200.
+
+    Returns False if the process exits or ``deadline_s`` passes.  llama-server
+    binds its port early and answers 503 while the weights load, so a short
+    probe interval costs one localhost request and saves up to the old fixed
+    3-5 s sleep on every load.
+    """
+    t0 = time.monotonic()
+    interval = 0.25
+    while time.monotonic() - t0 < deadline_s:
+        if proc.poll() is not None:
+            return False
+        try:
+            r = await client.get(f"{base_url}/health", timeout=5.0)
+            if r.status_code == 200:
+                return True
+        except httpx.HTTPError:
+            pass
+        await asyncio.sleep(interval)
+        interval = min(interval * 1.5, 2.0)
+    return False
+
+
+async def fetch_total_slots(client: httpx.AsyncClient, base_url: str) -> int | None:
+    """llama-server's parallel slot count, from ``GET /props``."""
+    try:
+        r = await client.get(f"{base_url}/props", timeout=5.0)
+        r.raise_for_status()
+        n = int(r.json().get("total_slots") or 0)
+        return n if n > 0 else None
+    except (httpx.HTTPError, ValueError, TypeError) as e:
+        logger.warning("could not read slot count from %s/props: %s", base_url, e)
+        return None

@@ -3,7 +3,32 @@
 A VRAM-aware REST API for running AI models on an RTX 5090 (32 GB). Models load on demand and are tracked by the `ModelManager`.
 
 **Base URL:** `http://<host>:8765`
-**Docs:** `http://<host>:8765/docs` (Swagger UI)
+**Docs:** `http://<host>:8765/docs` (Swagger UI) · `/redoc` · `/openapi.json`
+**Guides:** `http://<host>:8765/documentation` — this file and the rest of the project docs, served by the API (see [Documentation](#documentation))
+
+## Queueing & rate limits
+
+Every inference endpoint is admitted by **capacity, not by time**. Each backend
+runs as many requests as it physically can at once — `llm-chat`/`llm-embed` one
+per llama-server slot (read from its `/props` at load, 4 by default), `tts`,
+`stt` and `sdxl` one at a time — and further requests wait in a FIFO queue. A
+request is dispatched the instant a slot frees, so there is no need to retry on
+a timer: send it once and wait for the response.
+
+| Status | Meaning |
+|---|---|
+| `429` | The queue for that backend is full. `Retry-After` (seconds) is derived from the measured average service time ÷ slots — when the next queue place should open. |
+| `409` | The request was cancelled server-side (`POST /v1/chat/completions/cancel`). |
+| `499` | The client disconnected first (only visible in the server's access log). |
+
+Disconnecting abandons the request: a queued one gives up its place at once and
+never reaches the backend; a running chat/embedding request is aborted in
+llama-server and its slot freed. (TTS, STT and SDXL work can't be interrupted
+mid-run, so it finishes and keeps its slot until it does.)
+
+Queue limits: `CHAT_MAX_QUEUE` (32), `EMBED_MAX_QUEUE` (64), `TTS_MAX_QUEUE`
+(16), `STT_MAX_QUEUE` (16), `IMAGE_MAX_QUEUE` (8). Live figures are under
+`queues` in `GET /health`.
 
 ---
 
@@ -84,9 +109,20 @@ Returns GPU telemetry + VRAM status per model.
     "mem_total_gb": 31.8,
     "idle": false
   },
-  "sdxl_loaded": true
+  "sdxl_loaded": true,
+  "queues": {
+    "llm-chat": {
+      "capacity": 4, "running": 4, "queued": 2, "max_queue": 32,
+      "avg_service_s": 6.1, "est_wait_s": 6.1,
+      "completed": 1520, "rejected": 0, "abandoned": 3
+    }
+  }
 }
 ```
+
+`queues` has one entry per backend that has served a request: slots
+(`capacity`), what is `running` and `queued` now, the moving-average service
+time, the wait a new request should expect, and lifetime counters.
 
 ---
 
@@ -159,6 +195,16 @@ OpenAI-compatible chat. Body:
 
 Requires `llm-chat` model to be loaded first.
 
+### `POST /v1/chat/completions/cancel`
+Cancel every chat request currently running or queued, freeing all slots for new
+requests. Returns `{"cancelled": true, "count": 3}`. Running generations are
+stopped by closing their connection to llama-server; each cancelled request
+answers `409`. Use this to interrupt long responses and send a new request with
+different context.
+
+Not needed just to give up on one request: disconnecting does the same for that
+request alone.
+
 ---
 
 ## Embeddings
@@ -193,6 +239,51 @@ OpenAI-compatible txt2img.
 ```
 
 Returns base64-encoded PNG in `data[0].b64_json`. Auto-loads `sdxl` if not already loaded.
+
+---
+
+## Documentation
+
+All of the project's documentation is served by the API itself, read from the
+repo's markdown files on every request — so it is always the running code's docs.
+
+### `GET /documentation`
+Index of documents (`GET /` is the same).
+
+```json
+{
+  "documents": [
+    {"name": "readme", "title": "Overview", "file": "README.md", "url": "/documentation/readme", "summary": "..."},
+    {"name": "api", "title": "API reference", "file": "API.md", "url": "/documentation/api", "summary": "..."},
+    {"name": "agents", "title": "Engineering notes", "file": "AGENTS.md", "url": "/documentation/agents", "summary": "..."},
+    {"name": "skill", "title": "Agent skill", "file": "SKILL.md", "url": "/documentation/skill", "summary": "..."}
+  ],
+  "openapi": {"swagger_ui": "/docs", "redoc": "/redoc", "json": "/openapi.json"}
+}
+```
+
+### `GET /documentation/{name}?format=md|html`
+One document, by name (`readme`, `api`, `agents`, `skill`) or filename (`API.md`, any case).
+Returns `text/markdown` by default and rendered HTML to browsers (anything sending
+`Accept: text/html`); `?format=` overrides. Unknown names → `404` listing the valid ones.
+
+```bash
+curl http://<host>:8765/documentation/api          # this reference, as markdown
+```
+
+### `GET /SKILL.md`
+An [Agent Skills](https://agentskills.io)-format `SKILL.md` that teaches an AI agent how
+to use this API: what to check first, load rules, queueing etiquette, a call for every
+modality and an error table. Always raw markdown, so it can be read directly or
+saved into a skills directory:
+
+```bash
+mkdir -p ~/.claude/skills/ai-provider
+curl -s http://emperor.empirenet:8765/SKILL.md -o ~/.claude/skills/ai-provider/SKILL.md
+```
+
+The OpenAPI schema (`/docs`, `/redoc`) carries the queueing section above in its
+description and documents the `429`/`409` responses on every queued endpoint.
 
 ---
 

@@ -7,6 +7,8 @@ A VRAM-aware REST API server for running AI models on an RTX 5090 (32 GB). Writt
 ```
 server.py          — FastAPI app, routes, lifespan (entrypoint)
 model_manager.py   — VRAM-aware model registry (ModelManager singleton)
+admission.py       — capacity-based request gates (FIFO queue per backend)
+documentation.py   — serves the repo's .md files at /documentation (markdown or HTML)
 ctl/               — `ai-provider` CLI + tray icon (separate uv tool, not imported by the server)
 providers/
   tts.py           — Qwen3-TTS worker management + voice synthesis
@@ -32,6 +34,22 @@ providers/
   concurrent requests each saw `loaded == False` and each ran a full load. The providers
   hold their own locks too, so calling `start_worker()` / `provider.start()` directly is
   equally safe.
+- **Admission is by capacity, not time** — every inference call goes through an
+  `admission.Gate` sized to what its backend can run at once (llama-server's
+  `total_slots` from `/props`, 1 for TTS/STT/SDXL). Excess requests wait in a FIFO and
+  get a slot handed to them the moment one frees. Only slot holders reach the
+  backend, so upstream timeouts measure generation, not queueing. A client that
+  disconnects is dropped from the queue, or, if running on llama-server, aborted.
+  Thread-bound work (`to_thread` for STT/SDXL) and the TTS worker can't be stopped
+  mid-run, so they use `interruptible=False`: they keep the slot until the work really
+  ends, otherwise the next job would start on top of it. Over-full queues answer 429
+  with a `Retry-After` from the measured service time. Live state: `queues` in
+  `/health`.
+
+  This replaced a fixed `CHAT_MAX_INFLIGHT=8` counter (2026-10-05). It answered 429 past
+  8 requests and forwarded the rest to llama-server's own hidden queue. Clients
+  retried every ~250 ms, and abandoned requests kept generating. The logs show 1,282
+  rejections and 863 requests that sat queued until the 300 s read timeout (502).
 
 ## Running the server
 
@@ -95,7 +113,7 @@ And kill any with `taskkill /F /PID <pid>`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | GPU telemetry + VRAM per model |
+| GET | `/health` | GPU telemetry + VRAM per model + per-backend queue stats |
 | GET | `/models` | List all models, load status, and `busy` (load/unload in flight) |
 | POST | `/models/{name}/load?force=false` | Load a model (safe to call concurrently) |
 | POST | `/models/{name}/unload` | Unload a model (idempotent) |
@@ -105,9 +123,13 @@ And kill any with `taskkill /F /PID <pid>`.
 | POST | `/audio/voices` | Create/update a cloned voice |
 | PATCH | `/audio/voices/{tag}` | Update voice metadata |
 | DELETE | `/audio/voices/{tag}` | Delete a cloned voice |
-| POST | `/v1/chat/completions` | LLM chat |
+| POST | `/v1/chat/completions` | LLM chat (queues for a slot; 429 + `Retry-After` only when the queue is full) |
+| POST | `/v1/chat/completions/cancel` | Cancel all running/queued chat requests (they answer 409) |
 | POST | `/v1/embeddings` | Text embeddings |
 | POST | `/v1/images/generations` | txt2img (auto-loads SDXL) |
+| GET | `/documentation` | Index of the project docs (also `GET /`) |
+| GET | `/documentation/{name}` | `readme` / `api` / `agents` / `skill` as markdown, or HTML for browsers (`?format=md\|html`) |
+| GET | `/SKILL.md` | Agent skill for using this API (always raw markdown) |
 
 Legacy endpoints (`/tts`, `/clone`, `/clone/save`, `/clone/list`, `/clone/delete`, `/voices`) exist for popcorn4 backward compatibility.
 
@@ -149,9 +171,27 @@ Override per variant with `LLM_CHAT_MODEL` / `_CTX` / `_VRAM_GB` / `_MMPROJ` and
 
 ## Verification
 
-- `pytest tests/` — run the test suite (requires the server to be running)
+- `pytest tests/test_admission.py tests/test_llm_variants.py` — unit tests, no server or GPU needed
+- `pytest tests/test_api.py` — integration tests (require the server to be running)
 - Check `/health` for GPU state and loaded models
 - Models are cached via Hugging Face cache (shared with other projects)
+
+## Documentation
+
+Every doc is served by the API: `GET /documentation/{readme,api,agents}` reads the
+markdown file from disk per request, so editing a doc needs no restart. The registry is
+`documentation.py:DOCS`, a fixed list, so requests can't name arbitrary paths. **A new
+`.md` file only gets served once it is added there.** `tests/test_documentation.py`
+fails if a document's relative links don't resolve through the API.
+The "Queueing & rate limits" section of `API.md` is also lifted into the OpenAPI
+description at import, so keep that heading's name stable.
+
+`SKILL.md` is the agent-facing guide, served at `/SKILL.md` for other machines' agents.
+**When an endpoint, a load rule or an error code changes, update `SKILL.md` too.**
+`tests/test_documentation.py` checks that every endpoint it mentions exists.
+
+`ai-provider.md` is popcorn4's copy of `API.md` (identical). It is not served separately:
+popcorn4 can fetch `/documentation/api` instead.
 
 ## Cloned voices
 

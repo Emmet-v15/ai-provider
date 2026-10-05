@@ -14,6 +14,7 @@ Sections (top to bottom):
   8. Embed   — POST /v1/embeddings
   9. Image   — POST /v1/images/generations
   10. Legacy — popcorn4 compatibility wrappers (deprecated)
+  11. Docs   — GET /, /documentation, /documentation/{name}, /SKILL.md
 """
 
 from __future__ import annotations
@@ -28,9 +29,12 @@ from contextlib import asynccontextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
+
+import admission
+import documentation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai-provider")
@@ -42,13 +46,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 HOST = os.getenv("AI_PROVIDER_HOST", "0.0.0.0")
 PORT = int(os.getenv("AI_PROVIDER_PORT", "8765"))
 MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "1024"))
-CHAT_MAX_INFLIGHT = int(os.getenv("CHAT_MAX_INFLIGHT", "8"))
 
-# Admission control: beyond this many chat requests in flight (processing +
-# queued), reject immediately instead of letting an aggressive client build
-# an unbounded queue behind the 4 inference slots.
-_chat_inflight = 0
-_chat_inflight_lock = asyncio.Lock()
+# Admission control lives in admission.py: every backend has a gate sized to
+# what it can run at once (llama-server's slot count, one TTS/STT/SDXL job),
+# with a bounded FIFO behind it.  Queue limits: CHAT_MAX_QUEUE, EMBED_MAX_QUEUE,
+# TTS_MAX_QUEUE, STT_MAX_QUEUE, IMAGE_MAX_QUEUE.
 
 
 # ── orphan prevention ──────────────────────────────────────────────────
@@ -270,7 +272,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Provider",
-    version="0.7.0",
+    version="0.8.0",
     description=(
         "VRAM-aware REST API for local AI on an RTX 5090 (32 GB). All modalities:\n\n"
         "- **Chat** (text in/out) and **vision** (image in) — Qwen3.8-27B via llama-server\n"
@@ -279,7 +281,14 @@ app = FastAPI(
         "- **Embeddings** — nomic-embed-text\n"
         "- **Image generation** — SDXL\n\n"
         "Models are loaded/unloaded on demand via `/models/{name}/load`;"
-        " TTS and image generation auto-load. See the Models section for VRAM status."
+        " TTS and image generation auto-load. See the Models section for VRAM status.\n\n"
+        "**Full documentation** is served by this API: [/documentation](/documentation)"
+        " (index), [overview](/documentation/readme),"
+        " [API reference](/documentation/api),"
+        " [engineering notes](/documentation/agents) — raw markdown for API clients,"
+        " rendered HTML for browsers.\n\n"
+        # Lifted from API.md so the two can't drift apart.
+        + documentation.openapi_section("api", "Queueing & rate limits")
     ),
     lifespan=lifespan,
     docs_url="/docs",
@@ -292,8 +301,31 @@ app = FastAPI(
         {"name": "Embeddings", "description": "Text embeddings (OpenAI-compatible)"},
         {"name": "Image", "description": "Image generation (OpenAI-compatible)"},
         {"name": "Legacy", "description": "Deprecated popcorn4-compat endpoints"},
+        {"name": "Documentation", "description": "This project's guides, as markdown or HTML"},
     ],
 )
+
+# OpenAPI entries for the admission outcomes every gated endpoint can return
+# (see admission.py).  499 is left out: it is only ever logged, since the
+# client it would be sent to has already gone.
+ADMISSION_RESPONSES: dict[int | str, dict] = {
+    429: {
+        "description": "The backend's queue is full. Retry after `Retry-After` seconds, "
+                       "derived from the measured service time.",
+        "headers": {"Retry-After": {"schema": {"type": "integer"},
+                                    "description": "Seconds until a queue place should open."}},
+    },
+    409: {"description": "Cancelled server-side (e.g. `POST /v1/chat/completions/cancel`)."},
+}
+
+
+@app.exception_handler(admission.QueueFull)
+@app.exception_handler(admission.ClientGone)
+@app.exception_handler(admission.Cancelled)
+async def admission_error_handler(request: Request, exc: Exception):
+    """429 (with Retry-After) / 499 / 409 for refused, abandoned, cancelled."""
+    err = admission.http_error(exc)
+    return JSONResponse({"detail": err.detail}, status_code=err.status_code, headers=err.headers)
 
 
 @app.middleware("http")
@@ -454,6 +486,8 @@ async def health():
         },
         "gpu": gpu,
         "sdxl_loaded": img_state.pipe is not None,
+        # Per backend: slots, running, queued, mean service time, est. wait.
+        "queues": admission.all_stats(),
     }
 
 
@@ -483,9 +517,10 @@ class SpeechRequest(BaseModel):
     "/v1/audio/speech",
     tags=["Audio"],
     responses={200: {"content": {"audio/ogg": {}, "audio/wav": {}},
-                     "description": "Audio bytes; X-Waveform and X-Duration-Seconds headers."}},
+                     "description": "Audio bytes; X-Waveform and X-Duration-Seconds headers."},
+               **ADMISSION_RESPONSES},
 )
-async def v1_audio_speech(req: SpeechRequest):
+async def v1_audio_speech(req: SpeechRequest, request: Request):
     text = req.input
     if not text:
         raise HTTPException(400, "input is required")
@@ -504,7 +539,7 @@ async def v1_audio_speech(req: SpeechRequest):
             raise HTTPException(503, f"TTS failed to load: {e}")
 
     data, media_type, dur, wf = await synthesize_audio(
-        text, language, voice, fmt=fmt,
+        text, language, voice, fmt=fmt, request=request,
     )
     return Response(
         content=data,
@@ -515,8 +550,9 @@ async def v1_audio_speech(req: SpeechRequest):
 
 # ── STT ────────────────────────────────────────────────────────────────
 
-@app.post("/v1/audio/transcriptions", tags=["Audio"])
+@app.post("/v1/audio/transcriptions", tags=["Audio"], responses=ADMISSION_RESPONSES)
 async def v1_audio_transcriptions(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Form("whisper-1"),
     language: str = Form(None),
@@ -525,7 +561,9 @@ async def v1_audio_transcriptions(
     from providers.stt import transcribe
     audio_bytes = await file.read()
     try:
-        result = await transcribe(audio_bytes, language=language, response_format=response_format)
+        result = await transcribe(
+            audio_bytes, language=language, response_format=response_format, request=request,
+        )
         return Response(content=result, media_type="text/plain") if isinstance(result, str) else result
     except RuntimeError as e:
         raise HTTPException(503, str(e))
@@ -554,7 +592,7 @@ async def audio_voices_list():
     }
 
 
-@app.post("/audio/voices", tags=["Voices"])
+@app.post("/audio/voices", tags=["Voices"], responses=ADMISSION_RESPONSES)
 async def audio_voices_save(
     tag: str = Form(...),
     new_tag: str = Form(default=""),
@@ -758,8 +796,8 @@ class ChatRequest(BaseModel):
     }
 
 
-@app.post("/v1/chat/completions", tags=["Chat"])
-async def v1_chat_completions(req: ChatRequest):
+@app.post("/v1/chat/completions", tags=["Chat"], responses=ADMISSION_RESPONSES)
+async def v1_chat_completions(req: ChatRequest, request: Request):
     from providers.llm import get_provider
     prov = get_provider()
     if not prov.is_running:
@@ -769,21 +807,14 @@ async def v1_chat_completions(req: ChatRequest):
     # classification answers and retries before they finish, pinning all
     # 4 slots indefinitely.
     req.max_tokens = min(req.max_tokens, MAX_COMPLETION_TOKENS)
-    global _chat_inflight
-    async with _chat_inflight_lock:
-        if _chat_inflight >= CHAT_MAX_INFLIGHT:
-            raise HTTPException(
-                429,
-                f"Too many chat requests in flight ({_chat_inflight}); retry later.",
-            )
-        _chat_inflight += 1
+    # Waits in a FIFO for a free llama-server slot and is dispatched the
+    # moment one opens; dropped if the client disconnects while waiting.
     try:
-        return await prov.chat_completions(req.model_dump())
+        return await prov.chat_completions(req.model_dump(), request=request)
+    except admission.ADMISSION_ERRORS:
+        raise
     except Exception as e:
         raise HTTPException(502, f"LLM proxy error: {e}")
-    finally:
-        async with _chat_inflight_lock:
-            _chat_inflight -= 1
 
 
 # Diagnostic log: what clients actually ask for.  Disable with LOG_CHAT_CONTENT=0.
@@ -827,11 +858,15 @@ def _log_chat_body(req: ChatRequest):
 
 @app.post("/v1/chat/completions/cancel", tags=["Chat"])
 async def v1_chat_cancel():
-    """Cancel the currently in-flight LLM generation, if any."""
+    """Cancel every chat generation running or queued.
+
+    Running generations are aborted in llama-server (their slots free up
+    immediately); the cancelled requests answer 409.
+    """
     from providers.llm import get_provider
     prov = get_provider()
-    cancelled = prov.cancel_current()
-    return {"cancelled": cancelled}
+    n = prov.cancel_current()
+    return {"cancelled": n > 0, "count": n}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -843,14 +878,16 @@ class EmbedRequest(BaseModel):
     input: str | list[str] = Field(...)
 
 
-@app.post("/v1/embeddings", tags=["Embeddings"])
-async def v1_embeddings(req: EmbedRequest):
+@app.post("/v1/embeddings", tags=["Embeddings"], responses=ADMISSION_RESPONSES)
+async def v1_embeddings(req: EmbedRequest, request: Request):
     from providers.embeddings import get_provider
     prov = get_provider()
     if not prov.is_running:
         raise HTTPException(503, "Embeddings server not running. POST /models/llm-embed/load to start it.")
     try:
-        return await prov.embeddings(req.model_dump())
+        return await prov.embeddings(req.model_dump(), request=request)
+    except admission.ADMISSION_ERRORS:
+        raise
     except Exception as e:
         raise HTTPException(502, f"Embeddings proxy error: {e}")
 
@@ -870,8 +907,8 @@ class ImageGenRequest(BaseModel):
     seed: int | None = Field(default=None)
 
 
-@app.post("/v1/images/generations", tags=["Image"])
-async def v1_images_generations(req: ImageGenRequest):
+@app.post("/v1/images/generations", tags=["Image"], responses=ADMISSION_RESPONSES)
+async def v1_images_generations(req: ImageGenRequest, request: Request):
     from providers.image import generate_txt2img, state as img_state
     from model_manager import get_manager
 
@@ -895,6 +932,7 @@ async def v1_images_generations(req: ImageGenRequest):
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
             seed=req.seed,
+            request=request,
         )
     except RuntimeError as e:
         raise HTTPException(503, str(e))
@@ -918,8 +956,11 @@ class TTSRequest(BaseModel):
     speaker: str = Field(default="axel")
 
 
-@app.post("/tts", tags=["Legacy"], deprecated=True)
-async def legacy_tts(req: TTSRequest, format: str = Query("opus", pattern="^(wav|opus)$")):
+@app.post("/tts", tags=["Legacy"], deprecated=True, responses=ADMISSION_RESPONSES)
+async def legacy_tts(
+    req: TTSRequest, request: Request,
+    format: str = Query("opus", pattern="^(wav|opus)$"),
+):
     from providers.tts import synthesize_audio, is_running
     from model_manager import get_manager
 
@@ -931,7 +972,7 @@ async def legacy_tts(req: TTSRequest, format: str = Query("opus", pattern="^(wav
             raise HTTPException(503, f"TTS failed to load: {e}")
 
     data, media_type, dur, wf = await synthesize_audio(
-        req.text, req.language, req.speaker, fmt=format,
+        req.text, req.language, req.speaker, fmt=format, request=request,
     )
     return Response(
         content=data, media_type=media_type,
@@ -949,11 +990,14 @@ class CloneRequest(BaseModel):
     x_vector_only_mode: bool = False
 
 
-@app.post("/clone", tags=["Legacy"], deprecated=True)
-async def legacy_clone(req: CloneRequest, format: str = Query("opus", pattern="^(wav|opus)$")):
+@app.post("/clone", tags=["Legacy"], deprecated=True, responses=ADMISSION_RESPONSES)
+async def legacy_clone(
+    req: CloneRequest, request: Request,
+    format: str = Query("opus", pattern="^(wav|opus)$"),
+):
     from providers.tts import synthesize_clone
     data, media_type, dur, wf = await synthesize_clone(
-        req.text, req.language, req.ref_audio, req.ref_text, fmt=format,
+        req.text, req.language, req.ref_audio, req.ref_text, fmt=format, request=request,
     )
     return Response(
         content=data, media_type=media_type,
@@ -963,7 +1007,7 @@ async def legacy_clone(req: CloneRequest, format: str = Query("opus", pattern="^
 
 # ── clone/save → POST /audio/voices ────────────────────────────────────
 
-@app.post("/clone/save", tags=["Legacy"], deprecated=True)
+@app.post("/clone/save", tags=["Legacy"], deprecated=True, responses=ADMISSION_RESPONSES)
 async def legacy_clone_save(
     tag: str = Form(...),
     new_tag: str = Form(default=""),
@@ -1006,7 +1050,74 @@ async def legacy_list_voices():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  10. ENTRYPOINT
+#  10. DOCUMENTATION  (the repo's markdown, served from disk)
+# ══════════════════════════════════════════════════════════════════════════
+
+_FORMAT_QUERY = Query(
+    None, pattern="^(md|html)$",
+    description="`md` or `html`. Default: HTML if the client accepts `text/html` "
+                "(a browser), otherwise markdown.",
+)
+
+
+@app.get("/", tags=["Documentation"], include_in_schema=False)
+@app.get("/documentation", tags=["Documentation"])
+async def documentation_index(request: Request, format: str | None = _FORMAT_QUERY):
+    """Every document this API serves, plus links to the OpenAPI views."""
+    if documentation.wants_html(request.headers.get("accept"), format):
+        return HTMLResponse(documentation.render_index())
+    return {
+        "documents": documentation.index(),
+        "openapi": {"swagger_ui": "/docs", "redoc": "/redoc", "json": "/openapi.json"},
+    }
+
+
+@app.get(
+    "/SKILL.md",
+    tags=["Documentation"],
+    response_class=Response,
+    responses={200: {"content": {"text/markdown": {}},
+                     "description": "Agent Skills-format SKILL.md for this API."}},
+)
+async def skill_md():
+    """How an AI agent should use this API, as a SKILL.md.
+
+    Always raw markdown regardless of `Accept`, so it can be fetched or saved
+    straight into a skills directory. Rendered: `/documentation/skill`.
+    """
+    doc = documentation.DOCS["skill"]
+    try:
+        return Response(doc.read(), media_type="text/markdown; charset=utf-8")
+    except OSError as e:
+        raise HTTPException(500, f"Could not read {doc.filename}: {e}")
+
+
+@app.get(
+    "/documentation/{name}",
+    tags=["Documentation"],
+    responses={200: {"content": {"text/markdown": {}, "text/html": {}},
+                     "description": "The document, as markdown or rendered HTML."}},
+)
+async def documentation_get(name: str, request: Request, format: str | None = _FORMAT_QUERY):
+    """One document by name (`readme`, `api`, `agents`, `skill`) or filename (`API.md`).
+
+    Read from disk per request, so it is always the current text.
+    """
+    doc = documentation.find(name)
+    if doc is None:
+        raise HTTPException(
+            404, f"No document {name!r}. Available: {', '.join(documentation.DOCS)}",
+        )
+    try:
+        if documentation.wants_html(request.headers.get("accept"), format):
+            return HTMLResponse(documentation.render_doc(doc))
+        return Response(doc.read(), media_type="text/markdown; charset=utf-8")
+    except OSError as e:
+        raise HTTPException(500, f"Could not read {doc.filename}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  11. ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":

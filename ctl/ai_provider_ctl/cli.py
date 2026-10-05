@@ -48,7 +48,7 @@ def cmd_status(args) -> int:
               f"   ({v.get('loaded_gb', 0)} / {v.get('max_vram_gb', '?')} GB budget)")
         if g:
             print(f"  gpu:       {g.get('name', '?')}  {g.get('mem_used_gb')}/{g.get('mem_total_gb')} GB"
-                  f"  {g.get('gpu_util_pct')}%  {g.get('temp_c')}°C")
+                  f"  {g.get('gpu_util_pct')}%  {g.get('temp_c')}C")
         busy = {k: q for k, q in h.get("queues", {}).items() if q.get("running") or q.get("queued")}
         for k, q in busy.items():
             print(f"  queue:     {k} running {q['running']}, queued {q['queued']}")

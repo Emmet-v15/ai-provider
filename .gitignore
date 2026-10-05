@@ -25,3 +25,7 @@ popcorn4_AGENTS.md
 .env
 .env.*
 test_output.json
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/

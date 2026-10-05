@@ -60,9 +60,17 @@ endpoint documentation.
 ## Running
 
 ```pwsh
-uv run server.py        # binds 0.0.0.0:8765 — docs at /docs
-uv run pytest tests/    # integration tests
+uv tool install --editable .\ctl   # once: puts `ai-provider` and `ai-provider-tray` on PATH
+ai-provider start                  # background, no console window; binds 0.0.0.0:8765
+ai-provider status                 # running?, what's loaded, GPU, queues
+ai-provider stop | restart | logs -f
+ai-provider autostart on           # tray icon at sign-in, which starts the server
+uv run pytest tests/               # integration tests
 ```
+
+`uv run server.py` still works for a foreground run. The tray icon shows state by
+colour, has Start/Stop/Restart, and restarts the server if it dies while it is meant
+to be running (a deliberate `stop` is never undone). Logs go to `logs/server.log`.
 
 Hardware reference: RTX 5090 (32 GB). Any CUDA GPU with headroom for the registered
 VRAM budgets works; budgets are configured per model in `model_manager.py`.

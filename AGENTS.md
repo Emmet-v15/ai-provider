@@ -7,6 +7,7 @@ A VRAM-aware REST API server for running AI models on an RTX 5090 (32 GB). Writt
 ```
 server.py          — FastAPI app, routes, lifespan (entrypoint)
 model_manager.py   — VRAM-aware model registry (ModelManager singleton)
+ctl/               — `ai-provider` CLI + tray icon (separate uv tool, not imported by the server)
 providers/
   tts.py           — Qwen3-TTS worker management + voice synthesis
   tts_worker.py    — TTS inference subprocess
@@ -34,7 +35,19 @@ providers/
 
 ## Running the server
 
-- Start: `uv run server.py` (binds `0.0.0.0:8765`)
+- Normally runs in the background via the `ai-provider` CLI (`ctl/`, installed with
+  `uv tool install --editable .\ctl`): `start`, `stop`, `restart`, `status [--json]`,
+  `logs [-f]`, `tray`, `autostart on|off`. `start` launches `.venv\Scripts\python.exe
+  server.py` with no console, logging to `logs/server.log`. `stop` kills the server's
+  whole process tree, so it works on a hand-started `uv run server.py` too (it finds the
+  server by whoever owns the port). Autostart is a per-user `HKCU\...\Run` entry for
+  `ai-provider-tray --login`, not a Windows service: the models live under the user's
+  profile (HF cache, uv's Python), and it needs no admin rights. The tray's watchdog
+  restarts a crashed server only while `want == "running"` in
+  `%LOCALAPPDATA%\ai-provider\state.json`; `stop` sets it to `stopped`.
+- Never run a second server alongside a live one, even on another port: startup's
+  orphan cleanup kills *every* `llama-server.exe` and `tts_worker` on the machine.
+- Foreground: `uv run server.py` (binds `0.0.0.0:8765`)
 - `uv run` re-execs twice: `uv.exe` → `.venv\Scripts\python.exe` (a `py.exe` launcher
   shim) → the uv-managed CPython that actually owns the socket. So the listening PID is
   *not* the venv path — matters when matching a firewall rule to the binary, and it's why
